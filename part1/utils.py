@@ -9,12 +9,20 @@ import torch
 from tqdm.auto import tqdm
 import evaluate
 import random
+import re
 import argparse
 from nltk.corpus import wordnet
 from nltk import word_tokenize
 from nltk.tokenize.treebank import TreebankWordDetokenizer
 
 random.seed(0)
+
+_WORD_SPANS = re.compile(r"<[^>]*>|\b\w+(?:['\u2019]\w+)*\b")
+_PROTECTED_WORDS = {
+    "cannot", "neither", "never", "no", "nobody", "none",
+    "nor", "not", "nothing", "nowhere", "rarely", "without",
+}
+_KEYBOARD_ROWS = ("qwertyuiop", "asdfghjkl", "zxcvbnm")
 
 
 def example_transform(example):
@@ -44,7 +52,29 @@ def custom_transform(example):
 
     # You should update example["text"] using your transformation
 
-    raise NotImplementedError
+    def replace_word(match):
+        word = match.group(0)
+        # Skip tags, contractions, short/non-ASCII words, and protected cues.
+        if re.fullmatch(r"[A-Za-z]{5,}", word) is None or word.lower() in _PROTECTED_WORDS:
+            return word
+        if random.random() >= 0.50:
+            return word
+        position = random.randrange(1, len(word) - 1)
+        letter = word[position]
+        row = next(row for row in _KEYBOARD_ROWS if letter.lower() in row)
+        key_index = row.index(letter.lower())
+        neighbors = []
+        if key_index > 0:
+            neighbors.append(row[key_index - 1])
+        if key_index < len(row) - 1:
+            neighbors.append(row[key_index + 1])
+        replacement = random.choice(neighbors)
+        if letter.isupper():
+            replacement = replacement.upper()
+        return word[:position] + replacement + word[position + 1:]
+    # Substitution preserves unmatched characters and processes matches left to right.
+    example = example.copy()
+    example["text"] = _WORD_SPANS.sub(replace_word, example["text"])
 
     ##### YOUR CODE ENDS HERE ######
 

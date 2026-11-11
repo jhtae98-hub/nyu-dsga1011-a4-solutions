@@ -1,0 +1,89 @@
+{
+  "tokenizer_checkpoint": "google-t5/t5-small",
+  "tokenizer_class": "T5TokenizerFast",
+  "versions": {
+    "python": "3.11.18",
+    "transformers": "4.40.0",
+    "tokenizers": "0.19.1"
+  },
+  "python_executable": "C:\\Users\\user\\anaconda3\\envs\\dsga1011-hw4-part2\\python.exe",
+  "batch_size": 64,
+  "tokenizer_settings": {
+    "add_special_tokens": false,
+    "padding": false,
+    "truncation": false
+  },
+  "preprocessing": {
+    "question": "\"translate English to SQL: \" + question.strip()",
+    "sql": "sql.strip()",
+    "question_prefix": "translate English to SQL: ",
+    "preserve_pair_order": true
+  },
+  "counting_convention": {
+    "before": "Remove file line separators only; preserve all other line content.",
+    "mean": "Total returned token IDs divided by the number of examples; no rounding in JSON.",
+    "vocabulary": "Distinct returned token IDs across the entire split, separately for questions and SQL.",
+    "after": "Question lengths and vocabulary include the task prefix.",
+    "validation": "Reject mismatched counts or empty/whitespace-only records; never drop pairs."
+  },
+  "input_files": {
+    "train": {
+      "questions": "data/train.nl",
+      "sql": "data/train.sql"
+    },
+    "dev": {
+      "questions": "data/dev.nl",
+      "sql": "data/dev.sql"
+    }
+  },
+  "edge_whitespace_changes": {
+    "train": {
+      "questions_with_edge_whitespace": 0,
+      "sql_with_edge_whitespace": 0
+    },
+    "dev": {
+      "questions_with_edge_whitespace": 0,
+      "sql_with_edge_whitespace": 0
+    }
+  },
+  "before": {
+    "train": {
+      "num_examples": 4225,
+      "mean_question_tokens": 17.097278106508877,
+      "mean_sql_tokens": 216.37254437869822,
+      "question_vocabulary_size": 791,
+      "sql_vocabulary_size": 555,
+      "total_question_tokens": 72236,
+      "total_sql_tokens": 914174
+    },
+    "dev": {
+      "num_examples": 466,
+      "mean_question_tokens": 17.070815450643778,
+      "mean_sql_tokens": 210.05364806866953,
+      "question_vocabulary_size": 465,
+      "sql_vocabulary_size": 395,
+      "total_question_tokens": 7955,
+      "total_sql_tokens": 97885
+    }
+  },
+  "after": {
+    "train": {
+      "num_examples": 4225,
+      "mean_question_tokens": 22.097278106508877,
+      "mean_sql_tokens": 216.37254437869822,
+      "question_vocabulary_size": 795,
+      "sql_vocabulary_size": 555,
+      "total_question_tokens": 93361,
+      "total_sql_tokens": 914174
+    },
+    "dev": {
+      "num_examples": 466,
+      "mean_question_tokens": 22.070815450643778,
+      "mean_sql_tokens": 210.05364806866953,
+      "question_vocabulary_size": 469,
+      "sql_vocabulary_size": 395,
+      "total_question_tokens": 10285,
+      "total_sql_tokens": 97885
+    }
+  }
+}

@@ -1,42 +1,45 @@
 import os
 import argparse
+import json
+from pathlib import Path
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
-import numpy as np
-import wandb
-
-from t5_utils import initialize_model, initialize_optimizer_and_scheduler, save_model, load_model_from_checkpoint, setup_wandb
-from transformers import GenerationConfig
-from load_data import load_t5_data
-from utils import compute_metrics, save_queries_and_records
+from t5_utils import (initialize_model, initialize_optimizer_and_scheduler, save_model,
+                      load_model_from_checkpoint, setup_wandb, run_directory,
+                      checkpoint_path, load_run_settings)
+from transformers import T5TokenizerFast
+from load_data import load_t5_data, LABEL_PAD_IDX
+from utils import compute_metrics, save_queries_and_records, set_random_seeds
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 PAD_IDX = 0
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-def get_args():
+def get_args(argv=None):
     '''
     Arguments for training. You may choose to change or extend these as you see fit.
     '''
     parser = argparse.ArgumentParser(description='T5 training loop')
 
     # Model hyperparameters
-    parser.add_argument('--finetune', action='store_true', help="Whether to finetune T5 or not")
+    parser.add_argument('--finetune', action='store_true', help="Fine-tune pretrained T5; required for training")
+    parser.add_argument('--model_name', default='google-t5/t5-small')
     
     # Training hyperparameters
     parser.add_argument('--optimizer_type', type=str, default="AdamW", choices=["AdamW"],
                         help="What optimizer to use")
-    parser.add_argument('--learning_rate', type=float, default=1e-1)
+    parser.add_argument('--learning_rate', type=float, default=3e-4)
     parser.add_argument('--weight_decay', type=float, default=0)
 
-    parser.add_argument('--scheduler_type', type=str, default="cosine", choices=["none", "cosine", "linear"],
+    parser.add_argument('--scheduler_type', type=str, default="linear", choices=["none", "cosine", "linear"],
                         help="Whether to use a LR scheduler and what type to use if so")
-    parser.add_argument('--num_warmup_epochs', type=int, default=0,
+    parser.add_argument('--num_warmup_epochs', type=int, default=1,
                         help="How many epochs to warm up the learning rate for if using a scheduler")
-    parser.add_argument('--max_n_epochs', type=int, default=0,
+    parser.add_argument('--max_n_epochs', type=int, default=5,
                         help="How many epochs to train the model for")
-    parser.add_argument('--patience_epochs', type=int, default=0,
+    parser.add_argument('--patience_epochs', type=int, default=3,
                         help="If validation performance stops improving, how many epochs should we wait before stopping?")
 
     parser.add_argument('--use_wandb', action='store_true',
@@ -47,31 +50,79 @@ def get_args():
     # Data hyperparameters
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--test_batch_size', type=int, default=16)
+    parser.add_argument('--max_input_length', type=int, default=128)
+    parser.add_argument('--max_target_length', type=int, default=512)
+    parser.add_argument('--generation_max_new_tokens', type=int, default=512)
+    parser.add_argument('--num_beams', type=int, default=1, help='1 gives greedy decoding; sampling is disabled')
+    parser.add_argument('--max_train_examples', type=int, default=None, help='Optional small training subset for smoke tests')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--data_dir', type=Path, default=SCRIPT_DIR / 'data')
+    parser.add_argument('--checkpoint_root', type=Path, default=SCRIPT_DIR / 'checkpoints')
+    parser.add_argument('--results_root', type=Path, default=SCRIPT_DIR / 'results')
+    parser.add_argument('--records_root', type=Path, default=SCRIPT_DIR / 'records')
+    parser.add_argument('--eval_only', action='store_true', help='Load a checkpoint and evaluate without training')
+    parser.add_argument('--checkpoint_dir', type=Path, default=None, help='Explicit best/ or latest/ checkpoint directory')
+    parser.add_argument('--load_latest', action='store_true', help='Select latest instead of best in evaluation-only mode')
+    parser.add_argument('--predict_test', action='store_true', help='Opt in to test loading, generation, and record export')
+    parser.add_argument('--export_name', default=None, help='Test export stem; experiment gives assignment filenames')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    positive = ('batch_size', 'test_batch_size', 'max_n_epochs', 'patience_epochs',
+                'generation_max_new_tokens', 'num_beams')
+    if any(getattr(args, key) < 1 for key in positive):
+        parser.error('Batch sizes, epochs, patience, generation length, and beams must be positive.')
+    if min(args.max_input_length, args.max_target_length) < 2:
+        parser.error('Input and target limits must be at least 2.')
+    if args.learning_rate <= 0 or args.weight_decay < 0 or args.num_warmup_epochs < 0:
+        parser.error('Learning rate must be positive; weight decay and warmup must be nonnegative.')
+    if args.max_train_examples is not None and args.max_train_examples < 1:
+        parser.error('--max_train_examples must be positive.')
+    if not args.eval_only and not args.finetune:
+        parser.error('Use --finetune for this pretrained baseline, or --eval_only to load a checkpoint.')
+    if not args.eval_only and (args.checkpoint_dir is not None or args.load_latest):
+        parser.error('--checkpoint_dir and --load_latest require --eval_only.')
+    if args.export_name is not None and not args.predict_test:
+        parser.error('--export_name requires --predict_test.')
+    for name in (args.experiment_name, args.export_name):
+        if name is not None and (not name or name in ('.', '..') or '/' in name or '\\' in name):
+            parser.error('Experiment and export names must be single nonempty path components.')
     return args
+
+
+def output_paths(args, split):
+    sql_dir = Path(args.results_root) / args.experiment_name
+    record_dir = Path(args.records_root) / args.experiment_name
+    sql_name, record_name = f'{split}.sql', f'{split}.pkl'
+    if split == 'test' and args.export_name is not None:
+        sql_dir, record_dir = Path(args.results_root), Path(args.records_root)
+        sql_name = f't5_ft_{args.export_name}_test.sql'
+        record_name = f't5_ft_{args.export_name}_test.pkl'
+    sql_dir.mkdir(parents=True, exist_ok=True)
+    record_dir.mkdir(parents=True, exist_ok=True)
+    return sql_dir / sql_name, record_dir / record_name
 
 def train(args, model, train_loader, dev_loader, optimizer, scheduler):
     best_f1 = -1
     epochs_since_improvement = 0
 
-    model_type = 'ft' if args.finetune else 'scr'
-    checkpoint_dir = os.path.join('checkpoints', f'{model_type}_experiments', args.experiment_name)
-    gt_sql_path = os.path.join(f'data/dev.sql')
-    gt_record_path = os.path.join(f'records/ground_truth_dev.pkl')
-    model_sql_path = os.path.join(f'results/t5_{model_type}_{args.experiment_name}_dev.sql')
-    model_record_path = os.path.join(f'records/t5_{model_type}_{args.experiment_name}_dev.pkl')
+    checkpoint_dir = run_directory(args)
+    checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    gt_sql_path = args.data_dir / 'dev.sql'
+    gt_record_path = args.records_root / 'ground_truth_dev.pkl'
+    model_sql_path, model_record_path = output_paths(args, 'dev')
+    history = []
     for epoch in range(args.max_n_epochs):
         tr_loss = train_epoch(args, model, train_loader, optimizer, scheduler)
-        print(f"Epoch {epoch}: Average train loss was {tr_loss}")
+        print(f"Epoch {epoch + 1}: Average train loss was {tr_loss}")
 
         eval_loss, record_f1, record_em, sql_em, error_rate = eval_epoch(args, model, dev_loader,
                                                                          gt_sql_path, model_sql_path,
                                                                          gt_record_path, model_record_path)
-        print(f"Epoch {epoch}: Dev loss: {eval_loss}, Record F1: {record_f1}, Record EM: {record_em}, SQL EM: {sql_em}")
-        print(f"Epoch {epoch}: {error_rate*100:.2f}% of the generated outputs led to SQL errors")
+        print(f"Epoch {epoch + 1}: Dev loss: {eval_loss}, Record F1: {record_f1}, Record EM: {record_em}, SQL EM: {sql_em}")
+        print(f"Epoch {epoch + 1}: {error_rate*100:.2f}% of the generated outputs led to SQL errors")
 
         if args.use_wandb:
+            import wandb
             result_dict = {
                 'train/loss' : tr_loss,
                 'dev/loss' : eval_loss,
@@ -88,9 +139,14 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
         else:
             epochs_since_improvement += 1
 
-        save_model(checkpoint_dir, model, best=False)
+        metrics = dict(loss=eval_loss, record_f1=record_f1, record_em=record_em,
+                       sql_em=sql_em, error_rate=error_rate)
+        history.append(dict(epoch=epoch + 1, train_loss=tr_loss, **metrics))
+        (checkpoint_dir / 'history.json').write_text(json.dumps(history, indent=2) + '\n', encoding='utf-8')
+        save_options = dict(tokenizer=dev_loader.dataset.tokenizer, args=args, epoch=epoch + 1, metrics=metrics)
+        save_model(checkpoint_dir, model, best=False, **save_options)
         if epochs_since_improvement == 0:
-            save_model(checkpoint_dir, model, best=True)
+            save_model(checkpoint_dir, model, best=True, **save_options)
 
         if epochs_since_improvement >= args.patience_epochs:
             break
@@ -99,7 +155,7 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
     model.train()
     total_loss = 0
     total_tokens = 0
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=LABEL_PAD_IDX)
 
     for encoder_input, encoder_mask, decoder_input, decoder_targets, _ in tqdm(train_loader):
         optimizer.zero_grad()
@@ -108,13 +164,15 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
         decoder_input = decoder_input.to(DEVICE)
         decoder_targets = decoder_targets.to(DEVICE)
 
+        non_pad = decoder_targets != LABEL_PAD_IDX
         logits = model(
             input_ids=encoder_input,
             attention_mask=encoder_mask,
             decoder_input_ids=decoder_input,
+            decoder_attention_mask=non_pad,
+            use_cache=False,
         )['logits']
 
-        non_pad = decoder_targets != PAD_IDX
         loss = criterion(logits[non_pad], decoder_targets[non_pad])
         loss.backward()
         optimizer.step()
@@ -138,53 +196,137 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     should both provide good results. If you find that this component of evaluation takes too long with your compute,
     we found the cross-entropy loss (in the evaluation set) to be well (albeit imperfectly) correlated with F1 performance.
     '''
-    # TODO
     model.eval()
-    return 0, 0, 0, 0, 0
+    criterion = nn.CrossEntropyLoss(ignore_index=LABEL_PAD_IDX, reduction='sum')
+    total_loss, total_tokens, limit_hits = 0.0, 0, 0
+    predictions = []
+    tokenizer = dev_loader.dataset.tokenizer
+    with torch.no_grad():
+        for encoder_ids, encoder_mask, decoder_inputs, targets, initial in tqdm(dev_loader):
+            encoder_ids, encoder_mask = encoder_ids.to(DEVICE), encoder_mask.to(DEVICE)
+            decoder_inputs, targets = decoder_inputs.to(DEVICE), targets.to(DEVICE)
+            non_pad = targets != LABEL_PAD_IDX
+            logits = model(input_ids=encoder_ids, attention_mask=encoder_mask,
+                           decoder_input_ids=decoder_inputs, decoder_attention_mask=non_pad,
+                           use_cache=False).logits
+            total_loss += criterion(logits[non_pad], targets[non_pad]).item()
+            total_tokens += non_pad.sum().item()
+            decoded, hits = generate_sql(args, model, tokenizer, encoder_ids, encoder_mask, initial.to(DEVICE))
+            predictions.extend(decoded)
+            limit_hits += hits
+    if len(predictions) != len(dev_loader.dataset):
+        raise ValueError('Development generation lost example alignment.')
+    print(f'Dev generations without EOS at the length limit: {limit_hits}/{len(predictions)}')
+    save_queries_and_records(predictions, model_sql_path, model_record_path)
+    # The supplied utility returns SQL EM, Record EM, Record F1, then errors.
+    sql_em, record_em, record_f1, errors = compute_metrics(
+        gt_sql_pth, model_sql_path, gt_record_path, model_record_path
+    )
+    error_rate = sum(bool(error) for error in errors) / len(predictions)
+    return total_loss / total_tokens, float(record_f1), float(record_em), float(sql_em), error_rate
+
+
+def generate_sql(args, model, tokenizer, encoder_ids, encoder_mask, initial_decoder_inputs):
+    generated = model.generate(
+        input_ids=encoder_ids,
+        attention_mask=encoder_mask,
+        decoder_input_ids=initial_decoder_inputs,
+        decoder_start_token_id=model.config.decoder_start_token_id,
+        eos_token_id=model.config.eos_token_id,
+        pad_token_id=model.config.pad_token_id,
+        max_new_tokens=args.generation_max_new_tokens,
+        num_beams=args.num_beams,
+        do_sample=False,
+    )
+    limit_hits = (~generated.eq(model.config.eos_token_id).any(dim=1)).sum().item()
+    decoded = tokenizer.batch_decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    return [query.strip() for query in decoded], limit_hits
         
 def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     '''
     You must implement inference to compute your model's generated SQL queries and its associated 
     database records. Implementation should be very similar to eval_epoch.
     '''
-    pass
+    model.eval()
+    predictions, limit_hits = [], 0
+    with torch.no_grad():
+        for encoder_ids, encoder_mask, initial in tqdm(test_loader):
+            decoded, hits = generate_sql(args, model, test_loader.dataset.tokenizer,
+                                         encoder_ids.to(DEVICE), encoder_mask.to(DEVICE), initial.to(DEVICE))
+            predictions.extend(decoded)
+            limit_hits += hits
+    if len(predictions) != len(test_loader.dataset):
+        raise ValueError('Test generation lost example alignment.')
+    print(f'Test generations without EOS at the length limit: {limit_hits}/{len(predictions)}')
+    save_queries_and_records(predictions, model_sql_path, model_record_path)
+    print(f'Test queries: {model_sql_path}\nTest records: {model_record_path}')
 
 def main():
     # Get key arguments
     args = get_args()
-    if args.use_wandb:
-        # Recommended: Using wandb (or tensorboard) for result logging can make experimentation easier
-        setup_wandb(args)
+    if args.eval_only:
+        # Inference uses the tokenizer, lengths, decoding, and seed of this checkpoint.
+        saved = load_run_settings(args)
+        for key in ('experiment_name', 'finetune', 'model_name', 'seed', 'max_input_length',
+                    'max_target_length', 'generation_max_new_tokens', 'num_beams'):
+            setattr(args, key, saved[key])
+        tokenizer_source = checkpoint_path(args, best=not args.load_latest)
+    else:
+        if run_directory(args).exists():
+            raise FileExistsError(f'{run_directory(args)} already exists; choose a new --experiment_name.')
+        tokenizer_source = args.model_name
+    set_random_seeds(args.seed)
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    tokenizer = T5TokenizerFast.from_pretrained(tokenizer_source, local_files_only=args.eval_only)
+    wandb_run = setup_wandb(args) if args.use_wandb else None
 
     # Load the data and the model
-    train_loader, dev_loader, test_loader = load_t5_data(args.batch_size, args.test_batch_size)
-    model = initialize_model(args)
-    optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
+    train_loader, dev_loader, test_loader = load_t5_data(
+        args.batch_size, args.test_batch_size, tokenizer=tokenizer, data_folder=args.data_dir,
+        max_input_length=args.max_input_length, max_target_length=args.max_target_length,
+        include_train=not args.eval_only, include_test=args.predict_test,
+        max_train_examples=args.max_train_examples,
+    )
+    args.data_statistics = {
+        split: loader.dataset.length_report for split, loader in
+        (('train', train_loader), ('dev', dev_loader), ('test', test_loader)) if loader is not None
+    }
 
     # Train 
-    train(args, model, train_loader, dev_loader, optimizer, scheduler)
+    if not args.eval_only:
+        model = initialize_model(args)
+        print(f'Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+        optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
+        train(args, model, train_loader, dev_loader, optimizer, scheduler)
+        # Release the training model and optimizer before loading best weights.
+        del model, optimizer, scheduler
 
     # Evaluate
-    model = load_model_from_checkpoint(args, best=True)
+    model = load_model_from_checkpoint(args, best=not args.load_latest)
     model.eval()
     
     # Dev set
-    experiment_name = args.experiment_name
-    model_type = 'ft' if args.finetune else 'scr'
-    gt_sql_path = os.path.join(f'data/dev.sql')
-    gt_record_path = os.path.join(f'records/ground_truth_dev.pkl')
-    model_sql_path = os.path.join(f'results/t5_{model_type}_{experiment_name}_dev.sql')
-    model_record_path = os.path.join(f'records/t5_{model_type}_{experiment_name}_dev.pkl')
+    gt_sql_path = args.data_dir / 'dev.sql'
+    gt_record_path = args.records_root / 'ground_truth_dev.pkl'
+    model_sql_path, model_record_path = output_paths(args, 'dev')
     dev_loss, dev_record_f1, dev_record_em, dev_sql_em, dev_error_rate = eval_epoch(args, model, dev_loader,
                                                                                     gt_sql_path, model_sql_path,
                                                                                     gt_record_path, model_record_path)
     print(f"Dev set results: Loss: {dev_loss}, Record F1: {dev_record_f1}, Record EM: {dev_record_em}, SQL EM: {dev_sql_em}")
     print(f"Dev set results: {dev_error_rate*100:.2f}% of the generated outputs led to SQL errors")
+    metrics = dict(loss=dev_loss, record_f1=dev_record_f1, record_em=dev_record_em,
+                   sql_em=dev_sql_em, error_rate=dev_error_rate,
+                   checkpoint=str(checkpoint_path(args, best=not args.load_latest)))
+    (model_sql_path.parent / 'dev_metrics.json').write_text(
+        json.dumps(metrics, indent=2) + '\n', encoding='utf-8'
+    )
 
     # Test set
-    model_sql_path = os.path.join(f'results/t5_{model_type}_{experiment_name}_test.sql')
-    model_record_path = os.path.join(f'records/t5_{model_type}_{experiment_name}_test.pkl')
-    test_inference(args, model, test_loader, model_sql_path, model_record_path)
+    if args.predict_test:
+        model_sql_path, model_record_path = output_paths(args, 'test')
+        test_inference(args, model, test_loader, model_sql_path, model_record_path)
+    if wandb_run is not None:
+        wandb_run.finish()
 
 if __name__ == "__main__":
     main()

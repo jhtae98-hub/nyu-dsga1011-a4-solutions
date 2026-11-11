@@ -4,6 +4,7 @@ import os
 import re
 import pickle
 import random
+from pathlib import Path
 from tqdm import tqdm
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,7 +12,7 @@ from typing import List, Any
 
 import torch
 
-DB_PATH = 'data/flight_database.db'
+DB_PATH = Path(__file__).resolve().parent / 'data' / 'flight_database.db'
 
 def compute_metrics(gt_path: str, model_path: str, gt_query_records: str = None, model_query_records: str = None):
     '''
@@ -30,6 +31,9 @@ def compute_metrics(gt_path: str, model_path: str, gt_query_records: str = None,
     '''
     gt_qs, gt_records, _ = load_queries_and_records(gt_path, gt_query_records)
     model_qs, model_records, model_error_msgs = load_queries_and_records(model_path, model_query_records)
+
+    if not (len(gt_qs) == len(model_qs) == len(gt_records) == len(model_records) == len(model_error_msgs)):
+        raise ValueError("SQL queries and database records must have matching example counts.")
 
     sql_em = compute_sql_exact_match(gt_qs, model_qs)
     record_em = compute_record_exact_match(gt_records, model_records)
@@ -68,8 +72,12 @@ def save_queries_and_records(sql_queries: List[str], sql_path: str, record_path:
         * record_path (str): Path to save database records associated with queries
     '''
     # First save the queries
-    with open(sql_path, 'w') as f:
+    Path(sql_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(record_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(sql_path, 'w', encoding='utf-8') as f:
         for query in sql_queries:
+            if '\n' in query or '\r' in query:
+                raise ValueError("Each exported SQL query must occupy one line.")
             f.write(f'{query}\n')
 
     # Next compute and save records
@@ -78,7 +86,7 @@ def save_queries_and_records(sql_queries: List[str], sql_path: str, record_path:
         pickle.dump((records, error_msgs), f)
 
 def read_queries(sql_path: str):
-    with open(sql_path, 'r') as f:
+    with open(sql_path, 'r', encoding='utf-8') as f:
         qs = [q.strip() for q in f.readlines()]
     return qs
 
@@ -123,7 +131,10 @@ def compute_records(processed_qs: List[str]):
     return recs, error_msgs
 
 def compute_record(query_id, query):
-    conn = sqlite3.connect(DB_PATH)
+    if not query.strip():
+        return query_id, [], "Empty SQL query"
+    # Generated SQL is evaluated against the supplied database without modifying it.
+    conn = sqlite3.connect(DB_PATH.as_uri() + '?mode=ro', uri=True)
     cursor = conn.cursor()
 
     try:
