@@ -1,6 +1,8 @@
 import os
 import argparse
 import json
+import math
+import pickle
 from pathlib import Path
 from tqdm import tqdm
 
@@ -11,7 +13,8 @@ from t5_utils import (initialize_model, initialize_optimizer_and_scheduler, save
                       checkpoint_path, load_run_settings)
 from tokenizer_utils import load_tokenizer
 from load_data import load_t5_data, LABEL_PAD_IDX
-from utils import compute_metrics, save_queries_and_records, set_random_seeds
+from utils import compute_metrics, set_random_seeds
+from reevaluate_sql import execute_queries
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 PAD_IDX = 0
@@ -54,6 +57,11 @@ def get_args(argv=None):
     parser.add_argument('--max_target_length', type=int, default=512)
     parser.add_argument('--generation_max_new_tokens', type=int, default=512)
     parser.add_argument('--num_beams', type=int, default=1, help='1 gives greedy decoding; sampling is disabled')
+    # None distinguishes an omitted evaluation option from an explicit override.
+    parser.add_argument('--sql_timeout_seconds', type=float, default=None,
+                        help='Per-query execution deadline; default 10 seconds, or saved value in evaluation-only mode')
+    parser.add_argument('--sql_workers', type=int, default=None,
+                        help='SQL execution workers; default 2, or saved value in evaluation-only mode')
     parser.add_argument('--max_train_examples', type=int, default=None, help='Optional small training subset for smoke tests')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--data_dir', type=Path, default=SCRIPT_DIR / 'data')
@@ -80,6 +88,12 @@ def get_args(argv=None):
         parser.error('Learning rate must be positive; weight decay and warmup must be nonnegative.')
     if args.max_train_examples is not None and args.max_train_examples < 1:
         parser.error('--max_train_examples must be positive.')
+    try:
+        validate_sql_settings(args.sql_timeout_seconds, args.sql_workers)
+        if not args.eval_only:
+            resolve_sql_settings(args)
+    except ValueError as error:
+        parser.error(str(error))
     if not args.eval_only and not args.finetune:
         parser.error('Use --finetune for this pretrained baseline, or --eval_only to load a checkpoint.')
     if not args.eval_only and (args.checkpoint_dir is not None or args.load_latest):
@@ -99,11 +113,31 @@ def get_args(argv=None):
     return args
 
 
+def validate_sql_settings(timeout_seconds, workers):
+    if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+        raise ValueError('--sql_timeout_seconds must be finite and positive.')
+    if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int) or workers < 1):
+        raise ValueError('--sql_workers must be a positive integer.')
+
+
+def resolve_sql_settings(args, saved=None):
+    saved = saved or {}
+    for key, default in (('sql_timeout_seconds', 10.0), ('sql_workers', 2)):
+        if getattr(args, key) is None:
+            value = saved.get(key)
+            setattr(args, key, default if value is None else value)
+    validate_sql_settings(args.sql_timeout_seconds, args.sql_workers)
+
+
 def restore_checkpoint_settings(args):
     saved = load_run_settings(args)
     for key in ('experiment_name', 'finetune', 'model_name', 'seed', 'max_input_length',
                 'max_target_length', 'generation_max_new_tokens', 'num_beams'):
         setattr(args, key, saved[key])
+    # Explicit CLI values win; older checkpoints fall back to 10 seconds / 2 workers.
+    resolve_sql_settings(args, saved)
     if args.eval_num_beams is not None:
         if args.eval_name == args.experiment_name:
             raise ValueError('--eval_name must differ from the checkpoint experiment name when overriding beams.')
@@ -115,7 +149,8 @@ def evaluation_settings(args):
     return dict(checkpoint=str(checkpoint_path(args, best=not args.load_latest).resolve()),
                 eval_name=args.eval_name if args.eval_name is not None else args.experiment_name,
                 num_beams=args.num_beams,
-                generation_max_new_tokens=args.generation_max_new_tokens, do_sample=False)
+                generation_max_new_tokens=args.generation_max_new_tokens, do_sample=False,
+                sql_timeout_seconds=args.sql_timeout_seconds, sql_workers=args.sql_workers)
 
 
 def output_paths(args, split):
@@ -130,6 +165,27 @@ def output_paths(args, split):
     sql_dir.mkdir(parents=True, exist_ok=True)
     record_dir.mkdir(parents=True, exist_ok=True)
     return sql_dir / sql_name, record_dir / record_name
+
+
+def save_sql_predictions(args, predictions, sql_path, record_path):
+    database = args.data_dir / 'flight_database.db'
+    if not database.is_file():
+        raise FileNotFoundError(database)
+    if any('\n' in query or '\r' in query for query in predictions):
+        raise ValueError('Each exported SQL query must occupy one line.')
+    sql_path, record_path = Path(sql_path), Path(record_path)
+    sql_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    with sql_path.open('w', encoding='utf-8') as handle:
+        for query in predictions:
+            handle.write(f'{query}\n')
+    records, errors = execute_queries(predictions, database, args.sql_timeout_seconds, args.sql_workers)
+    if len(records) != len(predictions) or len(errors) != len(predictions):
+        raise ValueError('SQL execution lost example alignment.')
+    with record_path.open('wb') as handle:
+        pickle.dump((records, errors), handle)
+    return records, errors
+
 
 def train(args, model, train_loader, dev_loader, optimizer, scheduler):
     best_f1 = -1
@@ -170,7 +226,8 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
             epochs_since_improvement += 1
 
         metrics = dict(loss=eval_loss, record_f1=record_f1, record_em=record_em,
-                       sql_em=sql_em, error_rate=error_rate)
+                       sql_em=sql_em, error_rate=error_rate,
+                       sql_timeout_seconds=args.sql_timeout_seconds, sql_workers=args.sql_workers)
         history.append(dict(epoch=epoch + 1, train_loss=tr_loss, **metrics))
         (checkpoint_dir / 'history.json').write_text(json.dumps(history, indent=2) + '\n', encoding='utf-8')
         save_options = dict(tokenizer=dev_loader.dataset.tokenizer, args=args, epoch=epoch + 1, metrics=metrics)
@@ -247,10 +304,10 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     if len(predictions) != len(dev_loader.dataset):
         raise ValueError('Development generation lost example alignment.')
     print(f'Dev generations without EOS at the length limit: {limit_hits}/{len(predictions)}')
-    save_queries_and_records(predictions, model_sql_path, model_record_path)
+    save_sql_predictions(args, predictions, model_sql_path, model_record_path)
     # The supplied utility returns SQL EM, Record EM, Record F1, then errors.
     sql_em, record_em, record_f1, errors = compute_metrics(
-        gt_sql_pth, model_sql_path, gt_record_path, model_record_path
+        gt_sql_pth, model_sql_path, gt_query_records=gt_record_path, model_query_records=model_record_path
     )
     error_rate = sum(bool(error) for error in errors) / len(predictions)
     return total_loss / total_tokens, float(record_f1), float(record_em), float(sql_em), error_rate
@@ -288,7 +345,7 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     if len(predictions) != len(test_loader.dataset):
         raise ValueError('Test generation lost example alignment.')
     print(f'Test generations without EOS at the length limit: {limit_hits}/{len(predictions)}')
-    save_queries_and_records(predictions, model_sql_path, model_record_path)
+    save_sql_predictions(args, predictions, model_sql_path, model_record_path)
     print(f'Test queries: {model_sql_path}\nTest records: {model_record_path}')
 
 def main():
