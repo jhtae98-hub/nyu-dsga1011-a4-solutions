@@ -12,9 +12,9 @@ from importlib.metadata import version
 from pathlib import Path
 
 from preprocessing import QUESTION_PREFIX, preprocess_question, preprocess_sql
+from tokenizer_utils import CHECKPOINT, SQL_OPERATOR_TOKENS, load_tokenizer
 
 
-CHECKPOINT = "google-t5/t5-small"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR / "data"
 DEFAULT_OUTPUT = SCRIPT_DIR / "data_stats_results.json"
@@ -107,14 +107,13 @@ def main() -> None:
     # Validate all pairs before loading the tokenizer; never read the test split.
     pairs = {split: read_pairs(split) for split in ("train", "dev")}
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    from transformers import T5TokenizerFast
-
     print(f"Loading tokenizer only: {CHECKPOINT}", flush=True)
-    tokenizer = T5TokenizerFast.from_pretrained(CHECKPOINT)
+    original_tokenizer = load_tokenizer(CHECKPOINT, add_sql_tokens=False)
+    tokenizer = load_tokenizer(CHECKPOINT)
     before, after, whitespace_changes = {}, {}, {}
     for split, (questions, queries) in pairs.items():
         print(f"Measuring {split}: {len(questions)} aligned pairs", flush=True)
-        before[split] = measure_pairs(questions, queries, tokenizer, args.batch_size)
+        before[split] = measure_pairs(questions, queries, original_tokenizer, args.batch_size)
         processed_questions = [preprocess_question(question) for question in questions]
         processed_queries = [preprocess_sql(sql) for sql in queries]
         after[split] = measure_pairs(processed_questions, processed_queries, tokenizer, args.batch_size)
@@ -126,6 +125,12 @@ def main() -> None:
     results = {
         "tokenizer_checkpoint": CHECKPOINT,
         "tokenizer_class": type(tokenizer).__name__,
+        "tokenizer_configurations": {
+            "before": {"ordinary_added_tokens": {}},
+            "after": {"ordinary_added_tokens": {
+                token: tokenizer.convert_tokens_to_ids(token) for token in SQL_OPERATOR_TOKENS
+            }},
+        },
         "versions": {
             "python": sys.version.split()[0],
             "transformers": version("transformers"),
@@ -145,10 +150,10 @@ def main() -> None:
             "preserve_pair_order": True,
         },
         "counting_convention": {
-            "before": "Remove file line separators only; preserve all other line content.",
+            "before": "Original unmodified tokenizer; remove file line separators only and preserve other content.",
             "mean": "Total returned token IDs divided by the number of examples; no rounding in JSON.",
             "vocabulary": "Distinct returned token IDs across the entire split, separately for questions and SQL.",
-            "after": "Question lengths and vocabulary include the task prefix.",
+            "after": "Training tokenizer with ordinary < and <= tokens; question statistics include the task prefix.",
             "validation": "Reject mismatched counts or empty/whitespace-only records; never drop pairs.",
         },
         "input_files": {

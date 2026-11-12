@@ -10,6 +10,7 @@ from transformers import T5ForConditionalGeneration
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
 from preprocessing import QUESTION_PREFIX
+from tokenizer_utils import SQL_OPERATOR_TOKENS
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -18,12 +19,14 @@ def setup_wandb(args):
     config = json.loads(json.dumps(vars(args), default=str))
     return wandb.init(project="dsga1011-a4", name=args.experiment_name, config=config)
 
-def initialize_model(args):
+def initialize_model(args, tokenizer):
     """Initialize the pretrained baseline with every parameter trainable."""
     if not args.finetune:
         raise ValueError("This pretrained baseline requires --finetune.")
     model = T5ForConditionalGeneration.from_pretrained(args.model_name)
     check_special_tokens(model)
+    model.resize_token_embeddings(len(tokenizer))
+    check_tokenizer_size(model, tokenizer)
     model.requires_grad_(True)
     return model.to(DEVICE)
 
@@ -32,6 +35,14 @@ def check_special_tokens(model):
     if (model.config.pad_token_id != 0 or model.config.decoder_start_token_id != 0
             or model.config.eos_token_id != 1):
         raise ValueError("The data pipeline expects standard T5 PAD/start=0 and EOS=1.")
+
+
+def check_tokenizer_size(model, tokenizer):
+    size = len(tokenizer)
+    if (model.config.vocab_size != size
+            or model.get_input_embeddings().weight.shape[0] != size
+            or model.get_output_embeddings().weight.shape[0] != size):
+        raise ValueError("Model vocabulary does not match the configured tokenizer; use a matching checkpoint.")
 
 
 def run_directory(args):
@@ -56,6 +67,7 @@ def mkdir(dirpath):
             pass
 
 def save_model(checkpoint_dir, model, best, *, tokenizer, args, epoch, metrics):
+    check_tokenizer_size(model, tokenizer)
     target = Path(checkpoint_dir) / ("best" if best else "latest")
     target.mkdir(parents=True, exist_ok=True)
     model.generation_config.max_new_tokens = args.generation_max_new_tokens
@@ -68,6 +80,9 @@ def save_model(checkpoint_dir, model, best, *, tokenizer, args, epoch, metrics):
         "epoch": epoch,
         "dev_metrics": metrics,
         "preprocessing": {"question_prefix": QUESTION_PREFIX, "strip_question": True, "strip_sql": True},
+        "tokenizer": {"size": len(tokenizer),
+                      "ordinary_sql_tokens": {token: tokenizer.convert_tokens_to_ids(token)
+                                              for token in SQL_OPERATOR_TOKENS}},
         "generation": {"max_new_tokens": args.generation_max_new_tokens,
                        "num_beams": args.num_beams, "do_sample": False},
         "special_tokens": {"pad": model.config.pad_token_id,
@@ -81,12 +96,13 @@ def save_model(checkpoint_dir, model, best, *, tokenizer, args, epoch, metrics):
         json.dumps(settings, indent=2, default=str) + "\n", encoding="utf-8"
     )
 
-def load_model_from_checkpoint(args, best):
+def load_model_from_checkpoint(args, best, tokenizer):
     path = checkpoint_path(args, best)
     if not path.is_dir():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     model = T5ForConditionalGeneration.from_pretrained(path, local_files_only=True)
     check_special_tokens(model)
+    check_tokenizer_size(model, tokenizer)
     return model.to(DEVICE)
 
 def initialize_optimizer_and_scheduler(args, model, epoch_length):

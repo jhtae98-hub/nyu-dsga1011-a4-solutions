@@ -1,6 +1,17 @@
 {
   "tokenizer_checkpoint": "google-t5/t5-small",
   "tokenizer_class": "T5TokenizerFast",
+  "tokenizer_configurations": {
+    "before": {
+      "ordinary_added_tokens": {}
+    },
+    "after": {
+      "ordinary_added_tokens": {
+        "<": 32100,
+        "<=": 32101
+      }
+    }
+  },
   "versions": {
     "python": "3.11.18",
     "transformers": "4.40.0",
@@ -20,10 +31,10 @@
     "preserve_pair_order": true
   },
   "counting_convention": {
-    "before": "Remove file line separators only; preserve all other line content.",
+    "before": "Original unmodified tokenizer; remove file line separators only and preserve other content.",
     "mean": "Total returned token IDs divided by the number of examples; no rounding in JSON.",
     "vocabulary": "Distinct returned token IDs across the entire split, separately for questions and SQL.",
-    "after": "Question lengths and vocabulary include the task prefix.",
+    "after": "Training tokenizer with ordinary < and <= tokens; question statistics include the task prefix.",
     "validation": "Reject mismatched counts or empty/whitespace-only records; never drop pairs."
   },
   "input_files": {
@@ -70,20 +81,20 @@
     "train": {
       "num_examples": 4225,
       "mean_question_tokens": 22.097278106508877,
-      "mean_sql_tokens": 216.37254437869822,
+      "mean_sql_tokens": 216.20686390532543,
       "question_vocabulary_size": 795,
-      "sql_vocabulary_size": 555,
+      "sql_vocabulary_size": 556,
       "total_question_tokens": 93361,
-      "total_sql_tokens": 914174
+      "total_sql_tokens": 913474
     },
     "dev": {
       "num_examples": 466,
       "mean_question_tokens": 22.070815450643778,
-      "mean_sql_tokens": 210.05364806866953,
+      "mean_sql_tokens": 209.89055793991417,
       "question_vocabulary_size": 469,
-      "sql_vocabulary_size": 395,
+      "sql_vocabulary_size": 396,
       "total_question_tokens": 10285,
-      "total_sql_tokens": 97885
+      "total_sql_tokens": 97809
     }
   }
 }

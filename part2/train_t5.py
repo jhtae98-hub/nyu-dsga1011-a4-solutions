@@ -9,7 +9,7 @@ import torch.nn as nn
 from t5_utils import (initialize_model, initialize_optimizer_and_scheduler, save_model,
                       load_model_from_checkpoint, setup_wandb, run_directory,
                       checkpoint_path, load_run_settings)
-from transformers import T5TokenizerFast
+from tokenizer_utils import load_tokenizer
 from load_data import load_t5_data, LABEL_PAD_IDX
 from utils import compute_metrics, save_queries_and_records, set_random_seeds
 
@@ -277,7 +277,7 @@ def main():
         tokenizer_source = args.model_name
     set_random_seeds(args.seed)
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    tokenizer = T5TokenizerFast.from_pretrained(tokenizer_source, local_files_only=args.eval_only)
+    tokenizer = load_tokenizer(tokenizer_source, local_files_only=args.eval_only)
     wandb_run = setup_wandb(args) if args.use_wandb else None
 
     # Load the data and the model
@@ -294,7 +294,7 @@ def main():
 
     # Train 
     if not args.eval_only:
-        model = initialize_model(args)
+        model = initialize_model(args, tokenizer)
         print(f'Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
         optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
         train(args, model, train_loader, dev_loader, optimizer, scheduler)
@@ -302,7 +302,7 @@ def main():
         del model, optimizer, scheduler
 
     # Evaluate
-    model = load_model_from_checkpoint(args, best=not args.load_latest)
+    model = load_model_from_checkpoint(args, best=not args.load_latest, tokenizer=tokenizer)
     model.eval()
     
     # Dev set

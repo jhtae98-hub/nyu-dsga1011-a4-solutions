@@ -3,9 +3,9 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from transformers import T5TokenizerFast
 
 from preprocessing import preprocess_question, preprocess_sql
+from tokenizer_utils import configure_tokenizer, load_tokenizer
 
 PAD_IDX = 0
 LABEL_PAD_IDX = -100
@@ -19,7 +19,7 @@ class T5Dataset(Dataset):
             raise ValueError(f"Unknown split: {split}")
         if min(max_input_length, max_target_length) < 2:
             raise ValueError("Length limits must leave room for text and EOS.")
-        self.tokenizer = tokenizer if tokenizer is not None else T5TokenizerFast.from_pretrained("google-t5/t5-small")
+        self.tokenizer = configure_tokenizer(tokenizer) if tokenizer is not None else load_tokenizer()
         if self.tokenizer.pad_token_id != PAD_IDX or self.tokenizer.eos_token_id != 1:
             raise ValueError("This baseline expects T5's standard PAD=0 and EOS=1.")
         self.max_input_length = max_input_length

@@ -84,6 +84,6 @@ One limitation is that my augmentation handles only QWERTY neighbor-key typos. S
 | --- | ---: | ---: |
 | Number of examples | 4225 | 466 |
 | Mean sentence length | 22.10 | 22.07 |
-| Mean SQL query length | 216.37 | 210.05 |
+| Mean SQL query length | 216.21 | 209.89 |
 | Vocabulary size (natural language) | 795 | 469 |
-| Vocabulary size (SQL) | 555 | 395 |
+| Vocabulary size (SQL) | 556 | 396 |
