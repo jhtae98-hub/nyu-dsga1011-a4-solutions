@@ -61,6 +61,9 @@ def get_args(argv=None):
     parser.add_argument('--results_root', type=Path, default=SCRIPT_DIR / 'results')
     parser.add_argument('--records_root', type=Path, default=SCRIPT_DIR / 'records')
     parser.add_argument('--eval_only', action='store_true', help='Load a checkpoint and evaluate without training')
+    parser.add_argument('--eval_num_beams', type=int, default=None,
+                        help='Evaluation-only beam override applied after restoring checkpoint settings')
+    parser.add_argument('--eval_name', default=None, help='Evaluation output folder name; does not select a checkpoint')
     parser.add_argument('--checkpoint_dir', type=Path, default=None, help='Explicit best/ or latest/ checkpoint directory')
     parser.add_argument('--load_latest', action='store_true', help='Select latest instead of best in evaluation-only mode')
     parser.add_argument('--predict_test', action='store_true', help='Opt in to test loading, generation, and record export')
@@ -81,17 +84,44 @@ def get_args(argv=None):
         parser.error('Use --finetune for this pretrained baseline, or --eval_only to load a checkpoint.')
     if not args.eval_only and (args.checkpoint_dir is not None or args.load_latest):
         parser.error('--checkpoint_dir and --load_latest require --eval_only.')
+    if not args.eval_only and (args.eval_num_beams is not None or args.eval_name is not None):
+        parser.error('--eval_num_beams and --eval_name require --eval_only.')
+    if args.eval_num_beams is not None:
+        if args.eval_num_beams < 1:
+            parser.error('--eval_num_beams must be positive.')
+        if args.eval_name is None:
+            parser.error('--eval_num_beams requires a separate --eval_name to preserve baseline outputs.')
     if args.export_name is not None and not args.predict_test:
         parser.error('--export_name requires --predict_test.')
-    for name in (args.experiment_name, args.export_name):
+    for name in (args.experiment_name, args.export_name, args.eval_name):
         if name is not None and (not name or name in ('.', '..') or '/' in name or '\\' in name):
-            parser.error('Experiment and export names must be single nonempty path components.')
+            parser.error('Experiment, evaluation, and export names must be single nonempty path components.')
     return args
 
 
+def restore_checkpoint_settings(args):
+    saved = load_run_settings(args)
+    for key in ('experiment_name', 'finetune', 'model_name', 'seed', 'max_input_length',
+                'max_target_length', 'generation_max_new_tokens', 'num_beams'):
+        setattr(args, key, saved[key])
+    if args.eval_num_beams is not None:
+        if args.eval_name == args.experiment_name:
+            raise ValueError('--eval_name must differ from the checkpoint experiment name when overriding beams.')
+        args.num_beams = args.eval_num_beams
+    return checkpoint_path(args, best=not args.load_latest)
+
+
+def evaluation_settings(args):
+    return dict(checkpoint=str(checkpoint_path(args, best=not args.load_latest).resolve()),
+                eval_name=args.eval_name if args.eval_name is not None else args.experiment_name,
+                num_beams=args.num_beams,
+                generation_max_new_tokens=args.generation_max_new_tokens, do_sample=False)
+
+
 def output_paths(args, split):
-    sql_dir = Path(args.results_root) / args.experiment_name
-    record_dir = Path(args.records_root) / args.experiment_name
+    name = args.eval_name if args.eval_name is not None else args.experiment_name
+    sql_dir = Path(args.results_root) / name
+    record_dir = Path(args.records_root) / name
     sql_name, record_name = f'{split}.sql', f'{split}.pkl'
     if split == 'test' and args.export_name is not None:
         sql_dir, record_dir = Path(args.results_root), Path(args.records_root)
@@ -265,12 +295,8 @@ def main():
     # Get key arguments
     args = get_args()
     if args.eval_only:
-        # Inference uses the tokenizer, lengths, decoding, and seed of this checkpoint.
-        saved = load_run_settings(args)
-        for key in ('experiment_name', 'finetune', 'model_name', 'seed', 'max_input_length',
-                    'max_target_length', 'generation_max_new_tokens', 'num_beams'):
-            setattr(args, key, saved[key])
-        tokenizer_source = checkpoint_path(args, best=not args.load_latest)
+        # Restore saved defaults first, then apply only the explicit evaluation override.
+        tokenizer_source = restore_checkpoint_settings(args)
     else:
         if run_directory(args).exists():
             raise FileExistsError(f'{run_directory(args)} already exists; choose a new --experiment_name.')
@@ -309,6 +335,8 @@ def main():
     gt_sql_path = args.data_dir / 'dev.sql'
     gt_record_path = args.records_root / 'ground_truth_dev.pkl'
     model_sql_path, model_record_path = output_paths(args, 'dev')
+    resolved_settings = evaluation_settings(args)
+    print('Resolved evaluation settings: ' + json.dumps(resolved_settings, sort_keys=True), flush=True)
     dev_loss, dev_record_f1, dev_record_em, dev_sql_em, dev_error_rate = eval_epoch(args, model, dev_loader,
                                                                                     gt_sql_path, model_sql_path,
                                                                                     gt_record_path, model_record_path)
@@ -316,7 +344,7 @@ def main():
     print(f"Dev set results: {dev_error_rate*100:.2f}% of the generated outputs led to SQL errors")
     metrics = dict(loss=dev_loss, record_f1=dev_record_f1, record_em=dev_record_em,
                    sql_em=dev_sql_em, error_rate=dev_error_rate,
-                   checkpoint=str(checkpoint_path(args, best=not args.load_latest)))
+                   **resolved_settings)
     (model_sql_path.parent / 'dev_metrics.json').write_text(
         json.dumps(metrics, indent=2) + '\n', encoding='utf-8'
     )
