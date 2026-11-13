@@ -87,3 +87,48 @@ One limitation is that my augmentation handles only QWERTY neighbor-key typos. S
 | Mean SQL query length | 216.21 | 209.89 |
 | Vocabulary size (natural language) | 795 | 469 |
 | Vocabulary size (SQL) | 556 | 396 |
+
+## Q5 — T5 Fine-tuning Details
+
+**Table 3: Best-performing T5 model configuration**
+
+| Design choice | Description |
+|---|---|
+| Data processing | I removed surrounding whitespace from questions and SQL queries, and prefixed each question with `translate English to SQL: `. I preserved capitalization, punctuation, internal whitespace, and question–SQL alignment. |
+| Tokenization | I used `T5TokenizerFast` from `google-t5/t5-small` for both questions and SQL. I added `<` and `<=` as ordinary tokens to preserve these SQL operators. I also appended EOS to each question and SQL target and set their length limits to 128 and 512 tokens, including EOS. In addition, I padded each batch dynamically, masked padding, and used `-100` for padded target labels to exclude them from loss. Finally, I formed decoder inputs by shifting the targets right and starting with PAD. |
+| Architecture | I loaded `google-t5/t5-small` using `T5ForConditionalGeneration` and resized its embeddings to 32,102 tokens. Then, I fine-tuned all parameters, including the encoder, decoder, shared embeddings, and tied output head.|
+| Hyperparameters | I used AdamW with learning rate `3e-4`, weight decay `0`, training/evaluation batch sizes of `16`, and seed `42`. Moreover, I used a linear learning-rate schedule with one warmup epoch, where I allowed up to 15 epochs with early-stopping patience of 3 epochs without improvement in development Record F1. I generated SQL using 4 beams, no sampling, and at most 512 new tokens. |
+
+## Q6 — Results and Error Analysis
+
+**Table 4: Development and test results (%)**
+
+| System                                 | Query EM | F1 score |
+| -------------------------------------- | -------: | -------: |
+| **Dev Results**                        |          |          |
+| Full model, 15 epochs                  |    55.58 |    78.76 |
+| Baseline, 5 epochs, greedy decoding    |    28.76 |    54.32 |
+| Same baseline checkpoint, 4 beams      |    29.40 |    55.27 |
+| **Test Results**                       |          |          |
+| T5 fine-tuning                         |     0.00 |    76.60 |
+
+I used a 10-second per-query SQL timeout and two workers for all development comparisons. Four-beam decoding slightly improved baseline F1, while the longer 15 epoch training run achieved substantially higher development F1. I selected its epoch-13 checkpoint.
+
+The test Query EM of 0.00 is reproduced exactly as displayed by Gradescope.
+
+**Table 5: Qualitative analysis on the development set**
+
+| Error Type                         | Example Of Error                                                                                                                  | Error Description                                                                                                                                                    | Statistics |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------: |
+| Incorrect or missing time filters  | For “after 7am,” it generated `departure_time > 1800` instead of `departure_time > 700`.                                          | Executable queries used incorrect time values, operators, or omitted constraints. This suggests difficulty translating time expressions into precise SQL conditions. |     36/466 |
+| SQL syntax errors                  | For an aircraft query with “before 10am,” it generated an extra closing parenthesis after `departure_time < 1000`.                | I found malformed or incomplete SQL, which may reflect difficulty maintaining nested query structure during generation.                                              |     17/466 |
+| Invalid schema or alias references | For airport-to-downtown transportation in Pittsburgh, it referenced `city_2.city_code` without declaring `city city_2` in `FROM`. | I found 15 missing or invalid references and 3 ambiguous references. These suggest difficulty consistently tracking tables and aliases.                              |     18/466 |
+
+## Q7 — Performance Evaluation
+
+I submitted the final test SQL queries and their associated database records. My model achieved a test Record F1 of **76.60**, earning **25/25** performance points.
+
+## Submission Links
+
+- [GitHub repository](https://github.com/jhtae98-hub/nyu-dsga1011-a4-solutions)
+- [Google Drive folder](https://drive.google.com/drive/folders/1MdU0cuqHqmyIYim0LcTNSl89lX1Z5_rF?usp=drive_link)
